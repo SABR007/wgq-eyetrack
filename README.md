@@ -1,6 +1,6 @@
 # Question-Conditioned Gaze–Text Fusion for Reading Comprehension
 
-**EyeBench Practical Project — Eye Tracking Course, UZH**  
+**EyeBench Practical Project — Eye Tracking and NLP Course, UZH**  
 Abu Bakr Rahman Shaik (23-756-737) · Mariia Korchagina (22-898-134)
 
 ---
