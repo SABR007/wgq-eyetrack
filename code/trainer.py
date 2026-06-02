@@ -142,10 +142,14 @@ def train_fold(
 
     # If best checkpoint exists and no in-progress epoch checkpoint, training is done
     if os.path.exists(best_ckpt) and not os.path.exists(epoch_ckpt):
-        state = torch.load(best_ckpt, map_location='cpu', weights_only=False)
-        _base(model).load_state_dict(state['model'])
-        print(f'  [fold {fold_k}] Best checkpoint loaded — training already done.')
-        return state
+        try:
+            state = torch.load(best_ckpt, map_location='cpu', weights_only=False)
+            _base(model).load_state_dict(state['model'])
+            print(f'  [fold {fold_k}] Best checkpoint loaded — training already done.')
+            return state
+        except Exception as e:
+            print(f'  [fold {fold_k}] Best checkpoint corrupted ({e}) — deleting and retraining.')
+            os.remove(best_ckpt)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable, lr=config.LR, weight_decay=config.WEIGHT_DECAY)
