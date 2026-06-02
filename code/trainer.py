@@ -14,6 +14,7 @@ Key design decisions:
 import os
 import json
 import math
+import shutil
 
 import numpy as np
 import torch
@@ -24,6 +25,42 @@ from torch.optim.lr_scheduler import OneCycleLR
 from sklearn.metrics import roc_auc_score, balanced_accuracy_score
 
 import config
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint helpers — save to /tmp first, copy to Drive for persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ckpt_tmp(drive_path: str) -> str:
+    return f'/tmp/{os.path.basename(drive_path)}'
+
+def _save_ckpt(state: dict, drive_path: str) -> None:
+    tmp = _ckpt_tmp(drive_path)
+    torch.save(state, tmp)
+    try:
+        os.makedirs(os.path.dirname(drive_path), exist_ok=True)
+        shutil.copy2(tmp, drive_path)
+    except Exception as e:
+        print(f'    WARNING: Drive copy failed ({e}). Checkpoint in /tmp only.')
+
+def _load_ckpt(drive_path: str) -> dict:
+    tmp = _ckpt_tmp(drive_path)
+    for path, label in [(tmp, '/tmp'), (drive_path, 'Drive')]:
+        if os.path.exists(path):
+            try:
+                return torch.load(path, map_location='cpu', weights_only=False)
+            except Exception as e:
+                print(f'    Checkpoint ({label}) corrupted ({e}) — removing.')
+                os.remove(path)
+    raise FileNotFoundError(f'No valid checkpoint: {os.path.basename(drive_path)}')
+
+def _ckpt_exists(drive_path: str) -> bool:
+    return os.path.exists(_ckpt_tmp(drive_path)) or os.path.exists(drive_path)
+
+def _remove_ckpt(drive_path: str) -> None:
+    for p in [_ckpt_tmp(drive_path), drive_path]:
+        if os.path.exists(p):
+            os.remove(p)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,16 +177,14 @@ def train_fold(
     epoch_ckpt = f'{config.CKPT_DIR}/{variant_name}_fold{fold_k}_epoch.pt'
     os.makedirs(config.CKPT_DIR, exist_ok=True)
 
-    # If best checkpoint exists and no in-progress epoch checkpoint, training is done
-    if os.path.exists(best_ckpt) and not os.path.exists(epoch_ckpt):
+    if _ckpt_exists(best_ckpt) and not _ckpt_exists(epoch_ckpt):
         try:
-            state = torch.load(best_ckpt, map_location='cpu', weights_only=False)
+            state = _load_ckpt(best_ckpt)
             _base(model).load_state_dict(state['model'])
             print(f'  [fold {fold_k}] Best checkpoint loaded — training already done.')
             return state
-        except Exception as e:
-            print(f'  [fold {fold_k}] Best checkpoint corrupted ({e}) — deleting and retraining.')
-            os.remove(best_ckpt)
+        except FileNotFoundError:
+            print(f'  [fold {fold_k}] No valid best checkpoint — retraining.')
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable, lr=config.LR, weight_decay=config.WEIGHT_DECAY)
@@ -161,21 +196,19 @@ def train_fold(
 
     start_epoch, best_auroc, no_improve = 1, 0.0, 0
 
-    # Resume from epoch checkpoint if Colab disconnected mid-training
-    if os.path.exists(epoch_ckpt):
+    if _ckpt_exists(epoch_ckpt):
         try:
-            resume = torch.load(epoch_ckpt, map_location=device, weights_only=False)
+            resume = _load_ckpt(epoch_ckpt)
             _base(model).load_state_dict(resume['model'])
             optimizer.load_state_dict(resume['optimizer'])
             scheduler.load_state_dict(resume['scheduler'])
-            start_epoch  = resume['epoch'] + 1
-            best_auroc   = resume['best_auroc']
-            no_improve   = resume['no_improve']
+            start_epoch = resume['epoch'] + 1
+            best_auroc  = resume['best_auroc']
+            no_improve  = resume['no_improve']
             print(f'  [fold {fold_k}] Resumed from epoch {resume["epoch"]} '
                   f'(best_auroc={best_auroc:.1f})')
-        except Exception as e:
-            print(f'  [fold {fold_k}] Epoch ckpt unreadable ({e}) — starting fresh.')
-            os.remove(epoch_ckpt)
+        except FileNotFoundError:
+            print(f'  [fold {fold_k}] Epoch checkpoint unreadable — starting fresh.')
 
     for epoch in range(start_epoch, num_epochs + 1):
         loss = train_epoch(model, train_loader, optimizer, scheduler, device)
@@ -191,7 +224,7 @@ def train_fold(
         if improved:
             best_auroc = val_auroc
             no_improve = 0
-            torch.save({
+            _save_ckpt({
                 'model':      {k: v.cpu().clone() for k, v in _base(model).state_dict().items()},
                 'val_logits': val_logits,
                 'val_labels': val_labels,
@@ -199,7 +232,7 @@ def train_fold(
         else:
             no_improve += 1
 
-        torch.save({
+        _save_ckpt({
             'epoch':      epoch,
             'best_auroc': best_auroc,
             'no_improve': no_improve,
@@ -212,16 +245,15 @@ def train_fold(
             print(f'  [fold {fold_k}] Early stopping at epoch {epoch}')
             break
 
-    if os.path.exists(epoch_ckpt):
-        os.remove(epoch_ckpt)
+    _remove_ckpt(epoch_ckpt)
 
-    if not os.path.exists(best_ckpt):
+    try:
+        best = _load_ckpt(best_ckpt)
+        _base(model).load_state_dict(best['model'])
+        return best
+    except FileNotFoundError:
         print(f'  [fold {fold_k}] WARNING: no best checkpoint saved (model never improved).')
         return None
-
-    best = torch.load(best_ckpt, map_location='cpu', weights_only=False)
-    _base(model).load_state_dict(best['model'])
-    return best
 
 
 # ─────────────────────────────────────────────────────────────────────────────
