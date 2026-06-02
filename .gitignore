@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.pkl
+*.parquet
+*.pt
+*.feather
+data/
+cache*/
+results*/
+checkpoints*/
+logs/
+.ipynb_checkpoints/
