@@ -1,29 +1,25 @@
 """
-WGQModel — Word-Gaze-Question model.
+WGQModel — Word-Gaze-Question model (v2: RoBERTa-Large, partial fine-tuning).
+
+v2 changes vs v1:
+  - RoBERTa-Large (1024-d) — TEXT_DIM read dynamically so all downstream
+    layers (word_fusion, q_proj, classifier) scale automatically.
+  - Top UNFREEZE_TOP_LAYERS encoder layers unfrozen; remainder stays frozen.
+    Uses _setup_roberta_freezing() shared by all model classes.
+  - @torch.no_grad() removed from _encode() — gradients must flow through
+    the unfrozen layers during training.
+  - .to(torch.bfloat16) removed from RoBERTa init — weights stay float32;
+    bfloat16 compute handled by torch.autocast in train_epoch.
 
 Three complementary streams, one classifier:
 
   Stream 1 — Text (joint passage+question CLS)
-      RoBERTa( [CLS] passage [SEP][SEP] Question: {q} [SEP] ) → CLS token (768-d)
-      This is the strong text baseline; passage and question both visible.
+      RoBERTa( [CLS] passage [SEP][SEP] Question: {q} [SEP] ) → CLS (1024-d)
 
   Stream 2 — Word-Gaze-Question cross-attention
-      For each passage word:
-        - RoBERTa word embedding (scatter-meaned from token embeddings)
-        - IA gaze features (dwell time, regressions, skip, etc.)
-      Fused per-word representation cross-attends to question tokens:
-        "For words relevant to this question, did the reader pay attention?"
-      This is question-conditioned and works for unseen texts (uses actual word content).
+      Per-word: (RoBERTa word emb + IA gaze features) → cross-attn(question) → pool
 
-  Stream 3 — Global gaze statistics
-      6 trial-level handcrafted features (total reading time, regression count, etc.)
-      Equivalent to Random Forest feature set (BalAcc ~55 standalone).
-
-Ablation variants:
-  TextOnlyModel    (A2): Stream 1 CLS only, no gaze
-  NoQCondModel     (A1): Replace cross-attn with self-attn (question-agnostic gaze)
-  NoGazeStatsModel (A3): Zero out Stream 3
-  ZeroGazeModel    (A4): Zero out word-level IA features (text+question+stats only)
+  Stream 3 — 6 global gaze statistics
 """
 
 import torch
@@ -34,25 +30,54 @@ from transformers import RobertaModel
 import config
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helper: selective RoBERTa freezing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _setup_roberta_freezing(roberta: RobertaModel,
+                             unfreeze_top: int = config.UNFREEZE_TOP_LAYERS) -> None:
+    """
+    Freeze all RoBERTa parameters, then unfreeze the top `unfreeze_top`
+    encoder layers. Called identically by every model class so all variants
+    use the same encoder configuration.
+    """
+    # Step 1: freeze everything
+    for p in roberta.parameters():
+        p.requires_grad = False
+
+    # Step 2: selectively unfreeze top N transformer layers
+    if unfreeze_top > 0:
+        n_layers = len(roberta.encoder.layer)
+        for i in range(n_layers - unfreeze_top, n_layers):
+            for p in roberta.encoder.layer[i].parameters():
+                p.requires_grad = True
+        unfrozen = sum(p.numel() for p in roberta.parameters() if p.requires_grad)
+        print(f'    RoBERTa: {n_layers} layers total, top {unfreeze_top} unfrozen '
+              f'({unfrozen:,} trainable RoBERTa params)')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main model
+# ─────────────────────────────────────────────────────────────────────────────
+
 class WGQModel(nn.Module):
     def __init__(
         self,
-        num_ia_features: int = config.NUM_IA_FEATURES,
-        num_gaze_stats:  int = config.NUM_GAZE_STATS,
-        d:               int = config.D_MODEL,
-        nhead:           int = config.N_HEADS,
-        dropout:         float = config.DROPOUT,
-        roberta_name:    str = config.ROBERTA_NAME,
+        num_ia_features:    int   = config.NUM_IA_FEATURES,
+        num_gaze_stats:     int   = config.NUM_GAZE_STATS,
+        d:                  int   = config.D_MODEL,
+        nhead:              int   = config.N_HEADS,
+        dropout:            float = config.DROPOUT,
+        roberta_name:       str   = config.ROBERTA_NAME,
+        unfreeze_top_layers: int  = config.UNFREEZE_TOP_LAYERS,
     ):
         super().__init__()
         self.d = d
 
-        # ── Frozen RoBERTa-base shared across both streams ────────────────────
+        # ── RoBERTa with selective freezing ───────────────────────────────────
         self.roberta = RobertaModel.from_pretrained(roberta_name, add_pooling_layer=False)
-        for p in self.roberta.parameters():
-            p.requires_grad = False
-        self.roberta = self.roberta.to(torch.bfloat16)
-        TEXT_DIM = self.roberta.config.hidden_size   # 768
+        _setup_roberta_freezing(self.roberta, unfreeze_top_layers)
+        TEXT_DIM = self.roberta.config.hidden_size  # 1024 for large, 768 for base
 
         # ── Stream 2: IA gaze projection ─────────────────────────────────────
         self.gaze_proj = nn.Sequential(
@@ -62,6 +87,7 @@ class WGQModel(nn.Module):
         )
 
         # ── Stream 2: word-level (text + gaze) fusion → d ────────────────────
+        # TEXT_DIM is 1024 here, so input is 1024+64=1088
         self.word_fusion = nn.Sequential(
             nn.Linear(TEXT_DIM + 64, d),
             nn.GELU(),
@@ -78,6 +104,7 @@ class WGQModel(nn.Module):
         self.attn_drop    = nn.Dropout(dropout)
 
         # ── Classifier: concat all 3 streams ─────────────────────────────────
+        # Input: TEXT_DIM (1024) + d (256) + num_gaze_stats (6)
         head_in = TEXT_DIM + d + num_gaze_stats
         self.classifier = nn.Sequential(
             nn.Linear(head_in, 256),
@@ -89,8 +116,9 @@ class WGQModel(nn.Module):
             nn.Linear(64, 1),
         )
 
-    @torch.no_grad()
     def _encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        # @torch.no_grad() removed — gradients must flow through unfrozen layers.
+        # Frozen params naturally have no gradients (requires_grad=False).
         with torch.autocast('cuda', dtype=torch.bfloat16):
             return self.roberta(
                 input_ids=input_ids, attention_mask=attention_mask
@@ -104,18 +132,18 @@ class WGQModel(nn.Module):
     ) -> torch.Tensor:
         """Average RoBERTa sub-word token embeddings per passage word via scatter_add."""
         B, T, D = token_hidden.shape
-        valid  = (passage_wids >= 0)                        # (B, T)
-        w_safe = passage_wids.clamp(min=0, max=W - 1)      # (B, T)
+        valid  = (passage_wids >= 0)
+        w_safe = passage_wids.clamp(min=0, max=W - 1)
 
-        h = token_hidden * valid.unsqueeze(-1).float()     # zero non-passage tokens
-        w_exp = w_safe.unsqueeze(-1).expand(B, T, D)       # (B, T, D)
+        h = token_hidden * valid.unsqueeze(-1).float()
+        w_exp = w_safe.unsqueeze(-1).expand(B, T, D)
 
         word_sum = torch.zeros(B, W, D, device=token_hidden.device, dtype=token_hidden.dtype)
         word_cnt = torch.zeros(B, W,    device=token_hidden.device, dtype=token_hidden.dtype)
         word_sum.scatter_add_(1, w_exp,  h)
         word_cnt.scatter_add_(1, w_safe, valid.float())
 
-        return word_sum / (word_cnt.unsqueeze(-1) + 1e-8)   # (B, W, D)
+        return word_sum / (word_cnt.unsqueeze(-1) + 1e-8)
 
     def forward(
         self,
@@ -125,44 +153,35 @@ class WGQModel(nn.Module):
         q_ids:        torch.Tensor,   # (B, 64)
         q_mask:       torch.Tensor,   # (B, 64)
         word_gaze:    torch.Tensor,   # (B, W, NUM_IA_FEATURES)
-        word_mask:    torch.Tensor,   # (B, W)  — 1=valid, 0=pad
+        word_mask:    torch.Tensor,   # (B, W)
         global_stats: torch.Tensor,   # (B, NUM_GAZE_STATS)
     ) -> torch.Tensor:                # (B,)
 
         W = word_mask.size(1)
 
-        # One RoBERTa forward pass covers both streams
-        joint_hidden = self._encode(joint_ids, joint_mask)    # (B, 512, 768)
+        joint_hidden = self._encode(joint_ids, joint_mask)        # (B, 512, 1024)
+        text_cls     = joint_hidden[:, 0, :]                      # (B, 1024)
+        word_text    = self._scatter_word_embs(joint_hidden, passage_wids, W)  # (B, W, 1024)
 
-        # Stream 1: CLS from joint passage+question encoding
-        text_cls = joint_hidden[:, 0, :]                       # (B, 768)
+        q_hidden = self._encode(q_ids, q_mask)                    # (B, 64, 1024)
+        q_proj   = self.q_proj(q_hidden)                          # (B, 64, d)
 
-        # Stream 2a: passage word embeddings via scatter mean
-        word_text = self._scatter_word_embs(joint_hidden, passage_wids, W)  # (B, W, 768)
-
-        # Stream 2b: question-only encoding (separate short pass)
-        q_hidden = self._encode(q_ids, q_mask)                 # (B, 64, 768)
-        q_proj   = self.q_proj(q_hidden)                       # (B, 64, d)
-
-        # Stream 2: fuse word text + gaze
-        gaze_emb = self.gaze_proj(word_gaze)                   # (B, W, 64)
+        gaze_emb = self.gaze_proj(word_gaze)                      # (B, W, 64)
         fused    = self.word_fusion(
-            torch.cat([word_text, gaze_emb], dim=-1)           # (B, W, 768+64)
-        )                                                       # (B, W, d)
+            torch.cat([word_text, gaze_emb], dim=-1)              # (B, W, 1088)
+        )                                                          # (B, W, d)
 
-        # Stream 2: cross-attention — fused passage words (Q) attend to question (KV)
-        q_key_pad = ~q_mask.bool()                             # True = padding position
+        q_key_pad  = ~q_mask.bool()
         att_out, _ = self.cross_attn(fused, q_proj, q_proj,
                                      key_padding_mask=q_key_pad)
         att_out  = att_out.nan_to_num(0.0)
         attended = self.post_attn_ln(fused + self.attn_drop(att_out))  # (B, W, d)
 
-        # Stream 2: mask-weighted mean pool over passage words
-        wm     = word_mask.unsqueeze(-1).float()               # (B, W, 1)
-        pooled = (attended * wm).sum(1) / (wm.sum(1) + 1e-8)  # (B, d)
+        wm     = word_mask.unsqueeze(-1).float()
+        pooled = (attended * wm).sum(1) / (wm.sum(1) + 1e-8)     # (B, d)
 
         combined = torch.cat([text_cls, pooled, global_stats], dim=-1)
-        return self.classifier(combined).squeeze(-1)           # (B,)
+        return self.classifier(combined).squeeze(-1)              # (B,)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,12 +190,12 @@ class WGQModel(nn.Module):
 
 class TextOnlyModel(nn.Module):
     """A2: joint passage+question CLS only — no gaze streams."""
-    def __init__(self, dropout: float = config.DROPOUT, roberta_name: str = config.ROBERTA_NAME):
+    def __init__(self, dropout: float = config.DROPOUT,
+                 roberta_name: str = config.ROBERTA_NAME,
+                 unfreeze_top_layers: int = config.UNFREEZE_TOP_LAYERS):
         super().__init__()
         self.roberta = RobertaModel.from_pretrained(roberta_name, add_pooling_layer=False)
-        for p in self.roberta.parameters():
-            p.requires_grad = False
-        self.roberta = self.roberta.to(torch.bfloat16)
+        _setup_roberta_freezing(self.roberta, unfreeze_top_layers)
         dim = self.roberta.config.hidden_size
         self.clf = nn.Sequential(
             nn.Linear(dim, 128), nn.GELU(), nn.Dropout(dropout), nn.Linear(128, 1)
@@ -184,7 +203,8 @@ class TextOnlyModel(nn.Module):
 
     def forward(self, joint_ids, joint_mask, passage_wids=None,
                 q_ids=None, q_mask=None, word_gaze=None, word_mask=None, global_stats=None):
-        with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+        # torch.no_grad() removed — unfrozen layers need gradients
+        with torch.autocast('cuda', dtype=torch.bfloat16):
             h = self.roberta(input_ids=joint_ids, attention_mask=joint_mask).last_hidden_state
         return self.clf(h[:, 0, :].float()).squeeze(-1)
 
@@ -193,12 +213,10 @@ class NoQCondModel(nn.Module):
     """A1: No question conditioning — self-attention over fused passage words instead of cross-attn."""
     def __init__(self, num_ia_features=config.NUM_IA_FEATURES, num_gaze_stats=config.NUM_GAZE_STATS,
                  d=config.D_MODEL, nhead=config.N_HEADS, dropout=config.DROPOUT,
-                 roberta_name=config.ROBERTA_NAME):
+                 roberta_name=config.ROBERTA_NAME, unfreeze_top_layers=config.UNFREEZE_TOP_LAYERS):
         super().__init__()
         self.roberta = RobertaModel.from_pretrained(roberta_name, add_pooling_layer=False)
-        for p in self.roberta.parameters():
-            p.requires_grad = False
-        self.roberta = self.roberta.to(torch.bfloat16)
+        _setup_roberta_freezing(self.roberta, unfreeze_top_layers)
         TEXT_DIM = self.roberta.config.hidden_size
         self.gaze_proj   = nn.Sequential(nn.Linear(num_ia_features, 64), nn.GELU(), nn.Dropout(dropout*0.5))
         self.word_fusion = nn.Sequential(nn.Linear(TEXT_DIM + 64, d), nn.GELU(), nn.LayerNorm(d), nn.Dropout(dropout*0.5))
@@ -209,8 +227,8 @@ class NoQCondModel(nn.Module):
             nn.Linear(256, 64), nn.GELU(), nn.Dropout(dropout*0.5), nn.Linear(64, 1),
         )
 
-    @torch.no_grad()
     def _enc(self, ids, mask):
+        # @torch.no_grad() removed — unfrozen layers need gradients
         with torch.autocast('cuda', dtype=torch.bfloat16):
             return self.roberta(input_ids=ids, attention_mask=mask).last_hidden_state.float()
 
@@ -218,15 +236,15 @@ class NoQCondModel(nn.Module):
         B, T, D = h.shape
         valid  = (wids >= 0)
         w_safe = wids.clamp(0, W-1)
-        ws     = torch.zeros(B, W, D, device=h.device, dtype=h.dtype)
-        wc     = torch.zeros(B, W,    device=h.device, dtype=h.dtype)
+        ws = torch.zeros(B, W, D, device=h.device, dtype=h.dtype)
+        wc = torch.zeros(B, W,    device=h.device, dtype=h.dtype)
         ws.scatter_add_(1, w_safe.unsqueeze(-1).expand(B,T,D), h * valid.unsqueeze(-1).float())
         wc.scatter_add_(1, w_safe, valid.float())
         return ws / (wc.unsqueeze(-1) + 1e-8)
 
     def forward(self, joint_ids, joint_mask, passage_wids,
                 q_ids, q_mask, word_gaze, word_mask, global_stats):
-        W = word_mask.size(1)
+        W        = word_mask.size(1)
         jh       = self._enc(joint_ids, joint_mask)
         text_cls = jh[:, 0, :]
         wt       = self._scatter(jh, passage_wids, W)
@@ -265,7 +283,7 @@ class ZeroGazeModel(WGQModel):
 def build_model(variant: str = 'full_wgq', **kwargs) -> nn.Module:
     """Factory — returns model for given ablation variant key."""
     text_only_kwargs = {k: v for k, v in kwargs.items()
-                        if k in ('dropout', 'roberta_name')}
+                        if k in ('dropout', 'roberta_name', 'unfreeze_top_layers')}
     mapping = {
         'full_wgq':      (WGQModel,         kwargs),
         'no_q_cond':     (NoQCondModel,     kwargs),

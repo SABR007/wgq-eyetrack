@@ -1,14 +1,18 @@
 """
 Training, evaluation, and results aggregation.
 
-Key design decisions:
-- Model selection uses val AUROC (most stable metric on small datasets).
-- Threshold for balanced accuracy is optimized on val set after training,
-  not on the test set — prevents leakage.
-- Epoch checkpoint saved every epoch for Colab resume; deleted on clean finish.
-- Best checkpoint saves model weights + val logits/labels for threshold search.
-- train_fold returns None only if no epoch improved on the baseline (0.0 AUROC);
-  the calling code handles this gracefully.
+v2 changes vs v1:
+  - Differential learning rates: unfrozen RoBERTa layers use config.LR_ROBERTA (2e-5),
+    all other params use config.LR (3e-4).
+  - OneCycleLR max_lr passed as a list [LR_ROBERTA, LR] when RoBERTa params present.
+  - When UNFREEZE_TOP_LAYERS=0 (fully frozen RoBERTa), behaviour is identical to v1.
+
+Checkpoint strategy (fixes persistent Drive corruption):
+  - All torch.save() calls write to /tmp/ first (fast local SSD, never corrupts),
+    then copy to Drive (persistence across Colab disconnects).
+  - All torch.load() calls try /tmp/ first, fall back to Drive if /tmp/ is missing.
+  - If the Drive copy is corrupted, it is deleted and /tmp/ is used instead.
+  - On a fresh session after disconnect, /tmp/ is empty so Drive is the source.
 """
 
 import os
@@ -32,9 +36,15 @@ import config
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ckpt_tmp(drive_path: str) -> str:
+    """Returns the /tmp equivalent of a Drive checkpoint path."""
     return f'/tmp/{os.path.basename(drive_path)}'
 
+
 def _save_ckpt(state: dict, drive_path: str) -> None:
+    """
+    Save to /tmp first (never corrupts), then copy to Drive.
+    If the Drive copy fails, the /tmp version is still valid for this session.
+    """
     tmp = _ckpt_tmp(drive_path)
     torch.save(state, tmp)
     try:
@@ -43,7 +53,12 @@ def _save_ckpt(state: dict, drive_path: str) -> None:
     except Exception as e:
         print(f'    WARNING: Drive copy failed ({e}). Checkpoint in /tmp only.')
 
+
 def _load_ckpt(drive_path: str) -> dict:
+    """
+    Load checkpoint. Tries /tmp first (fast, reliable), then Drive.
+    Deletes corrupted files and raises FileNotFoundError if both are unusable.
+    """
     tmp = _ckpt_tmp(drive_path)
     for path, label in [(tmp, '/tmp'), (drive_path, 'Drive')]:
         if os.path.exists(path):
@@ -54,10 +69,14 @@ def _load_ckpt(drive_path: str) -> dict:
                 os.remove(path)
     raise FileNotFoundError(f'No valid checkpoint: {os.path.basename(drive_path)}')
 
+
 def _ckpt_exists(drive_path: str) -> bool:
+    """True if checkpoint exists in /tmp or Drive."""
     return os.path.exists(_ckpt_tmp(drive_path)) or os.path.exists(drive_path)
 
+
 def _remove_ckpt(drive_path: str) -> None:
+    """Delete checkpoint from both /tmp and Drive."""
     for p in [_ckpt_tmp(drive_path), drive_path]:
         if os.path.exists(p):
             os.remove(p)
@@ -134,15 +153,14 @@ def collect_preds(model, loader, device):
 
 def evaluate(logits_np: np.ndarray, labels_np: np.ndarray,
              threshold: float = 0.5) -> tuple[float, float]:
-    probs  = torch.sigmoid(torch.tensor(logits_np)).numpy()
-    preds  = (probs > threshold).astype(int)
-    auroc  = roc_auc_score(labels_np, probs) * 100 if len(np.unique(labels_np)) > 1 else 50.0
+    probs   = torch.sigmoid(torch.tensor(logits_np)).numpy()
+    preds   = (probs > threshold).astype(int)
+    auroc   = roc_auc_score(labels_np, probs) * 100 if len(np.unique(labels_np)) > 1 else 50.0
     bal_acc = balanced_accuracy_score(labels_np, preds) * 100
     return auroc, bal_acc
 
 
 def optimize_threshold(val_logits: np.ndarray, val_labels: np.ndarray) -> float:
-    """Grid-search threshold [0.20, 0.80] to maximise balanced accuracy on val set."""
     probs  = torch.sigmoid(torch.tensor(val_logits.astype(np.float32))).numpy()
     labels = val_labels.astype(int)
     best_t, best_ba = 0.5, 0.0
@@ -154,6 +172,55 @@ def optimize_threshold(val_logits: np.ndarray, val_labels: np.ndarray) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Optimizer builder — differential LR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_optimizer_and_scheduler(model: nn.Module, n_steps: int):
+    """
+    AdamW + OneCycleLR with differential learning rates.
+    Unfrozen RoBERTa layers → LR_ROBERTA; everything else → LR.
+    Falls back to single-group when RoBERTa is fully frozen.
+    """
+    base = _base(model)
+
+    roberta_params = [p for n, p in base.named_parameters()
+                      if 'roberta' in n and p.requires_grad]
+    other_params   = [p for n, p in base.named_parameters()
+                      if 'roberta' not in n and p.requires_grad]
+
+    if roberta_params:
+        optimizer = AdamW(
+            [
+                {'params': roberta_params, 'lr': config.LR_ROBERTA},
+                {'params': other_params,   'lr': config.LR},
+            ],
+            weight_decay=config.WEIGHT_DECAY,
+        )
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=[config.LR_ROBERTA, config.LR],
+            total_steps=n_steps,
+            pct_start=0.1,
+            anneal_strategy='cos',
+        )
+        print(f'    Optimizer: AdamW  |  RoBERTa LR={config.LR_ROBERTA}  '
+              f'|  other LR={config.LR}  '
+              f'|  roberta_params={sum(p.numel() for p in roberta_params):,}')
+    else:
+        optimizer = AdamW(other_params, lr=config.LR, weight_decay=config.WEIGHT_DECAY)
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=config.LR,
+            total_steps=n_steps,
+            pct_start=0.1,
+            anneal_strategy='cos',
+        )
+        print(f'    Optimizer: AdamW  |  single LR={config.LR}  (RoBERTa fully frozen)')
+
+    return optimizer, scheduler
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Full fold training
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -162,21 +229,20 @@ def train_fold(
     train_loader,
     val_loader,
     fold_k:       int,
-    variant_name: str = 'wgq',
-    device:       str = config.DEVICE if hasattr(config, 'DEVICE') else 'cuda',
-    num_epochs:   int = config.NUM_EPOCHS,
-    patience:     int = config.PATIENCE,
+    variant_name: str   = 'wgq',
+    device:       str   = 'cuda',
+    num_epochs:   int   = config.NUM_EPOCHS,
+    patience:     int   = config.PATIENCE,
 ) -> dict | None:
     """
     Train model for one fold with early stopping on val AUROC.
-
-    Returns best-checkpoint dict {model, val_logits, val_labels}
-    or None if training fails (no improvement at all).
+    Checkpoints are saved to /tmp first, then copied to Drive.
     """
     best_ckpt  = f'{config.CKPT_DIR}/{variant_name}_fold{fold_k}_best.pt'
     epoch_ckpt = f'{config.CKPT_DIR}/{variant_name}_fold{fold_k}_epoch.pt'
     os.makedirs(config.CKPT_DIR, exist_ok=True)
 
+    # If best checkpoint exists and no in-progress epoch checkpoint, fold is done
     if _ckpt_exists(best_ckpt) and not _ckpt_exists(epoch_ckpt):
         try:
             state = _load_ckpt(best_ckpt)
@@ -186,16 +252,12 @@ def train_fold(
         except FileNotFoundError:
             print(f'  [fold {fold_k}] No valid best checkpoint — retraining.')
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(trainable, lr=config.LR, weight_decay=config.WEIGHT_DECAY)
-    scheduler = OneCycleLR(
-        optimizer, max_lr=config.LR,
-        total_steps=num_epochs * len(train_loader),
-        pct_start=0.1, anneal_strategy='cos',
-    )
+    n_steps = num_epochs * len(train_loader)
+    optimizer, scheduler = _build_optimizer_and_scheduler(model, n_steps)
 
     start_epoch, best_auroc, no_improve = 1, 0.0, 0
 
+    # Resume from epoch checkpoint if Colab disconnected mid-training
     if _ckpt_exists(epoch_ckpt):
         try:
             resume = _load_ckpt(epoch_ckpt)
@@ -216,7 +278,7 @@ def train_fold(
         val_auroc, val_ba = evaluate(val_logits, val_labels)
 
         improved = val_auroc > best_auroc
-        marker = ' *' if improved else ''
+        marker   = ' *' if improved else ''
         print(f'  [fold {fold_k}] ep {epoch:2d}/{num_epochs}  '
               f'loss={loss:.4f}  val_AUROC={val_auroc:.1f}  val_BalAcc={val_ba:.1f}{marker}',
               flush=True)
@@ -261,12 +323,6 @@ def train_fold(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def aggregate_fold_results(fold_results: dict) -> dict:
-    """
-    Compute mean ± SEM across folds.
-
-    Returns dict with keys like "Seen reader, unseen text|auroc":
-      {mean, sem, formatted, n_folds}
-    """
     data = {r: {'auroc': [], 'bal_acc': []} for r in config.REGIME_NAMES}
     data['All'] = {'auroc': [], 'bal_acc': []}
 
@@ -321,4 +377,4 @@ def print_comparison_table(summary: dict) -> None:
     for name, auroc, bal in baselines:
         print(f'{name:<42} {auroc:>14} {bal:>15}')
     print('-' * 74)
-    print(f'{"WGQModel (this work)":<42} {our_auroc:>14} {our_bal:>15}')
+    print(f'{"WGQModel v2 (large, unfreeze2)":<42} {our_auroc:>14} {our_bal:>15}')
