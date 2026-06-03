@@ -53,7 +53,7 @@ Classify  MLP(1024 + 256 + 6) → logit
 | Text-Only RoBERTa-Large | 61.1 | 55.0 |
 | PLM-AS-RM | 58.4 | 55.2 |
 | Random Forest | 58.0 | 55.1 |
-| **WGQModel (ours)** | **59.2** | **54.6** |
+| **WGQModel (ours)** | 59.2 | 54.6 |
 
 WGQModel beats PLM-AS-RM and Random Forest on AUROC, and matches MAG-Eye on Balanced Accuracy. On the *Unseen reader, Seen text* regime specifically, **66.7 AUROC** beats all non-MAG-Eye baselines.
 
